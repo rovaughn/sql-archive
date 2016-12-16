@@ -11,6 +11,7 @@ import (
 	"os"
 	ospath "path"
 	"regexp"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,12 @@ type Fileset struct {
 	pos      *regexp.Regexp
 	neg      *regexp.Regexp
 	toSearch []string
+}
+
+// slightly optimizes regexes.  Basically .*$ and ^.* are the same as nothing
+// when used in a match.
+func Optimize(s string) string {
+	return strings.Replace(strings.Replace(s, ".*$", "", -1), "^.*", "", -1)
 }
 
 // Semantically, a fileset is the intersection between the set of valid paths
@@ -64,15 +71,17 @@ func NewFileset(patterns []string) (*Fileset, error) {
 		}
 	}
 
-	pos, err := regexp.Compile("^" + strings.Join(posPieces, "$|^") + "$")
+	pos, err := regexp.Compile(Optimize("(^" + strings.Join(posPieces, "$)|(^") + "$)"))
 	if err != nil {
 		return nil, err
 	}
 
-	neg, err := regexp.Compile("^" + strings.Join(negPieces, "$|^") + "$")
+	neg, err := regexp.Compile(Optimize("(^" + strings.Join(negPieces, "$)|(^") + "$)"))
 	if err != nil {
 		return nil, err
 	}
+
+	log.Printf("pos %q neg %q", pos, neg)
 
 	return &Fileset{
 		pos:      pos,
@@ -231,7 +240,17 @@ func (file *File) Read() ([]byte, error) {
 func main() {
 	dest := flag.String("dest", "", "Destination file")
 	maxSize := flag.Int("max-size", 1000*1000, "Maximum file size to back up")
+	cpuprofile := flag.String("cpuprofile", "", "CPU profile output")
 	flag.Parse()
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			panic(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	if *dest == "" {
 		log.Printf("-dest required")
@@ -281,6 +300,12 @@ func main() {
 	}
 	defer tx.Rollback()
 
+	insertQuery, err := tx.Prepare(`INSERT INTO file (path, modtime, mode, data) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		panic(err)
+	}
+	defer insertQuery.Close()
+
 	for file := range fileset.Files() {
 		if handled[file.Path] {
 			continue
@@ -303,7 +328,7 @@ func main() {
 			}
 
 			log.Printf("Adding %s", file.Path)
-			if _, err := tx.Exec(`INSERT INTO file (path, modtime, mode, data) VALUES (?, ?, ?, ?)`, file.Path, file.Info.ModTime(), file.Info.Mode(), data); err != nil {
+			if _, err := insertQuery.Exec(file.Path, file.Info.ModTime(), file.Info.Mode(), data); err != nil {
 				panic(err)
 			}
 		}(file)
