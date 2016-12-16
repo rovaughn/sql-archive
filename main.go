@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
+	gitignorelib "github.com/monochromegane/go-gitignore"
 	"io/ioutil"
 	"log"
 	"os"
@@ -89,7 +90,7 @@ type File struct {
 	Info os.FileInfo
 }
 
-func (fs *Fileset) walk(ch chan<- File, wg *sync.WaitGroup, path string) {
+func (fs *Fileset) walk(ch chan<- File, wg *sync.WaitGroup, path string, gitignore gitignorelib.IgnoreMatcher) {
 	defer wg.Done()
 	dir, err := os.Open(path)
 	if err != nil {
@@ -104,13 +105,24 @@ func (fs *Fileset) walk(ch chan<- File, wg *sync.WaitGroup, path string) {
 
 	dir.Close()
 
+	newGitignore, err := gitignorelib.NewGitIgnore(ospath.Join(path, ".gitignore"), path)
+	if err != nil && !os.IsNotExist(err) {
+		panic(err)
+	} else if newGitignore != nil {
+		gitignore = newGitignore
+	}
+
 	for _, file := range files {
 		path := ospath.Join(path, file.Name())
 
+		if gitignore != nil && gitignore.Match(path, file.IsDir()) {
+			continue
+		}
+
 		if file.IsDir() {
 			wg.Add(1)
-			fs.walk(ch, wg, path)
-		} else if fs.Contains(path) {
+			fs.walk(ch, wg, path, gitignore)
+		} else if fs.Contains(path) && (gitignore == nil || !gitignore.Match(path, false)) {
 			ch <- File{
 				Path: path,
 				Info: file,
@@ -126,7 +138,7 @@ func (fs *Fileset) Files() <-chan File {
 
 	wg.Add(len(fs.toSearch))
 	for _, path := range fs.toSearch {
-		go fs.walk(ch, &wg, path)
+		go fs.walk(ch, &wg, path, nil)
 	}
 
 	go func() {
@@ -138,14 +150,20 @@ func (fs *Fileset) Files() <-chan File {
 }
 
 func HandleExisting(db *sql.DB, dbmx *sync.Mutex, handled map[string]bool, fileset *Fileset) {
-	rows, err := db.Query("SELECT path, modtime FROM file")
+	dbmx.Lock()
+	defer dbmx.Unlock()
+
+	tx, err := db.Begin()
+	if err != nil {
+		panic(err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("SELECT path, modtime FROM file")
 	if err != nil {
 		panic(err)
 	}
 	defer rows.Close()
-
-	dbmx.Lock()
-	defer dbmx.Unlock()
 
 	var toDelete []string
 	var toUpdate []File
@@ -181,7 +199,7 @@ func HandleExisting(db *sql.DB, dbmx *sync.Mutex, handled map[string]bool, files
 
 	for _, path := range toDelete {
 		log.Printf("Dropping %s", path)
-		if _, err := db.Exec(`DELETE FROM file WHERE path = ?`, path); err != nil {
+		if _, err := tx.Exec(`DELETE FROM file WHERE path = ?`, path); err != nil {
 			panic(err)
 		}
 	}
@@ -193,10 +211,12 @@ func HandleExisting(db *sql.DB, dbmx *sync.Mutex, handled map[string]bool, files
 		}
 
 		log.Printf("Updating %s", file.Path)
-		if _, err := db.Exec(`UPDATE file SET modtime = ?, mode = ?, data = ? WHERE path = ?`, file.Info.ModTime(), file.Info.Mode(), data, file.Path); err != nil {
+		if _, err := tx.Exec(`UPDATE file SET modtime = ?, mode = ?, data = ? WHERE path = ?`, file.Info.ModTime(), file.Info.Mode(), data, file.Path); err != nil {
 			panic(err)
 		}
 	}
+
+	tx.Commit()
 }
 
 func (file *File) Read() ([]byte, error) {
@@ -273,8 +293,7 @@ func main() {
 			defer dbmx.Unlock()
 
 			if file.Info.Size() > int64(*maxSize) {
-				log.Printf("Skipping %s due to size", file.Path)
-				return
+				panic(fmt.Sprintf("%s is bigger than max size (%s > %s)", file.Path, FormatBytes(uint64(file.Info.Size())), FormatBytes(uint64(*maxSize))))
 			}
 
 			data, err := file.Read()
