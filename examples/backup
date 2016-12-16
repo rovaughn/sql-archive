@@ -1,0 +1,35 @@
+#!/bin/bash
+set -eux -o pipefail
+backup_dir=$HOME/.backup
+cd "$HOME"
+mkdir -p "$backup_dir"
+rm -f "$backup_dir"/backup.db
+if [ -e "$backup_dir"/last-time ]; then
+    last_time=$(stat -c %Y "$backup_dir"/last-time)
+else
+    last_time=0
+fi
+touch "$backup_dir"/new-time
+new_time=$(stat -c %Y "$backup_dir"/new-time)
+sql-archive \
+    -dest "$backup_dir"/backup.db -newer-than "$last_time" -max-size 15000000 \
+    patterns...
+cd "$backup_dir"
+if [ "$(sqlite3 backup.db 'SELECT COUNT(*) FROM file;')" -gt 0 ]; then
+    zstd -f backup.db
+    box seal -password-file password <backup.db.zst >backup.db.zst.box
+
+    new_date=$(date -d @"$new_time" -u +%FT%T)
+
+    if [ "$last_time" -eq 0 ]; then
+        s3cmd put backup.db.zst.box \
+            s3://rovaughn-backups/"$new_date".db.zst.box
+    else
+        last_date=$(date -d @"$last_time" -u +%FT%T)
+        s3cmd put backup.db.zst.box \
+            s3://rovaughn-backups/"$last_date"-"$new_date".db.zst.box
+    fi
+
+    mv new-time last-time
+fi
+rm -f new-time backup.db backup.db.zst backup.db.zst.box

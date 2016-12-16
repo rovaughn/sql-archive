@@ -81,8 +81,6 @@ func NewFileset(patterns []string) (*Fileset, error) {
 		return nil, err
 	}
 
-	log.Printf("pos %q neg %q", pos, neg)
-
 	return &Fileset{
 		pos:      pos,
 		neg:      neg,
@@ -158,76 +156,6 @@ func (fs *Fileset) Files() <-chan File {
 	return ch
 }
 
-func HandleExisting(db *sql.DB, dbmx *sync.Mutex, handled map[string]bool, fileset *Fileset) {
-	dbmx.Lock()
-	defer dbmx.Unlock()
-
-	tx, err := db.Begin()
-	if err != nil {
-		panic(err)
-	}
-	defer tx.Rollback()
-
-	rows, err := tx.Query("SELECT path, modtime FROM file")
-	if err != nil {
-		panic(err)
-	}
-	defer rows.Close()
-
-	var toDelete []string
-	var toUpdate []File
-
-	for rows.Next() {
-		var path string
-		var modtime time.Time
-		if err := rows.Scan(&path, &modtime); err != nil {
-			panic(err)
-		}
-
-		if !fileset.Contains(path) {
-			toDelete = append(toDelete, path)
-			continue
-		}
-
-		fi, err := os.Lstat(path)
-		if os.IsNotExist(err) {
-			toDelete = append(toDelete, path)
-		} else if err != nil {
-			panic(err)
-		} else if modtime.Before(fi.ModTime()) {
-			toUpdate = append(toUpdate, File{
-				Path: path,
-				Info: fi,
-			})
-		}
-
-		handled[path] = true
-	}
-
-	rows.Close()
-
-	for _, path := range toDelete {
-		log.Printf("Dropping %s", path)
-		if _, err := tx.Exec(`DELETE FROM file WHERE path = ?`, path); err != nil {
-			panic(err)
-		}
-	}
-
-	for _, file := range toUpdate {
-		data, err := file.Read()
-		if err != nil {
-			panic(err)
-		}
-
-		log.Printf("Updating %s", file.Path)
-		if _, err := tx.Exec(`UPDATE file SET modtime = ?, mode = ?, data = ? WHERE path = ?`, file.Info.ModTime(), file.Info.Mode(), data, file.Path); err != nil {
-			panic(err)
-		}
-	}
-
-	tx.Commit()
-}
-
 func (file *File) Read() ([]byte, error) {
 	if file.Info.IsDir() || file.Info.Mode()&os.ModeSymlink != 0 {
 		link, err := os.Readlink(file.Path)
@@ -237,8 +165,75 @@ func (file *File) Read() ([]byte, error) {
 	}
 }
 
+type DBLock struct {
+	lock sync.Mutex
+	db   *sql.DB
+	tx   *sql.Tx
+}
+
+func (dbl *DBLock) Lock() *sql.Tx {
+	dbl.lock.Lock()
+	return dbl.tx
+}
+
+func (dbl *DBLock) Unlock() {
+	dbl.lock.Unlock()
+}
+
+func (dbl *DBLock) Commit() error {
+	if dbl != nil {
+		dbl.tx.Commit()
+		dbl.db.Close()
+	}
+	return nil
+}
+
+func (dbl *DBLock) Rollback() error {
+	if dbl != nil {
+		dbl.tx.Rollback()
+		dbl.db.Close()
+	}
+	return nil
+}
+
+func OpenDB(name string) (*DBLock, error) {
+	db, err := sql.Open("sqlite3", name)
+	if err != nil {
+		return nil, err
+	}
+
+	var schemaVersion int
+	if err := db.QueryRow("PRAGMA schema_version").Scan(&schemaVersion); err != nil {
+		return nil, err
+	}
+
+	if schemaVersion == 0 {
+		if _, err := db.Exec(`
+			CREATE TABLE file (
+				path    TEXT UNIQUE NOT NULL,
+				modtime TIMESTAMP NOT NULL,
+				mode    INTEGER NOT NULL,
+				data    BLOB NULL
+			)
+		`); err != nil {
+			return nil, err
+		}
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+
+	return &DBLock{
+		db: db,
+		tx: tx,
+	}, nil
+}
+
 func main() {
-	dest := flag.String("dest", "", "Destination file")
+	dest := flag.String("dest", "", "Database file to synchronize with filesystem")
+	newerThanVar := flag.Int("newer-than", 0, "Only include changes newer than this timestamp.")
 	maxSize := flag.Int("max-size", 1000*1000, "Maximum file size to back up")
 	cpuprofile := flag.String("cpuprofile", "", "CPU profile output")
 	flag.Parse()
@@ -252,74 +247,51 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
+	log.Println("dest", *dest)
+
 	if *dest == "" {
 		log.Printf("-dest required")
 		os.Exit(1)
 	}
+
+	newerThan := time.Unix(int64(*newerThanVar), 0)
 
 	fileset, err := NewFileset(flag.Args())
 	if err != nil {
 		panic(err)
 	}
 
-	db, err := sql.Open("sqlite3", *dest)
+	db, err := OpenDB(*dest)
 	if err != nil {
 		panic(err)
 	}
-	defer db.Close()
+	defer db.Rollback()
 
-	var schemaVersion int
-
-	if err := db.QueryRow("PRAGMA schema_version").Scan(&schemaVersion); err != nil {
+	insertQuery, err := db.tx.Prepare(`INSERT INTO file (path, modtime, mode, data) VALUES (?, ?, ?, ?)`)
+	if err != nil {
 		panic(err)
 	}
-
-	if schemaVersion == 0 {
-		if _, err := db.Exec(`
-			CREATE TABLE file (
-				path TEXT UNIQUE NOT NULL,
-				modtime TIMESTAMP NOT NULL,
-				mode INTEGER NOT NULL,
-				data BLOB
-			)
-		`); err != nil {
-			panic(err)
-		}
-	}
-
-	var dbmx sync.Mutex
 
 	handled := make(map[string]bool)
-	HandleExisting(db, &dbmx, handled, fileset)
 
 	var wg sync.WaitGroup
-
-	tx, err := db.Begin()
-	if err != nil {
-		panic(err)
-	}
-	defer tx.Rollback()
-
-	insertQuery, err := tx.Prepare(`INSERT INTO file (path, modtime, mode, data) VALUES (?, ?, ?, ?)`)
-	if err != nil {
-		panic(err)
-	}
-	defer insertQuery.Close()
 
 	for file := range fileset.Files() {
 		if handled[file.Path] {
 			continue
 		}
 
+		if file.Info.Size() > int64(*maxSize) {
+			panic(fmt.Sprintf("%s is bigger than max size (%s > %s)", file.Path, FormatBytes(uint64(file.Info.Size())), FormatBytes(uint64(*maxSize))))
+		}
+
+		if !file.Info.ModTime().After(newerThan) {
+			continue
+		}
+
 		wg.Add(1)
 		go func(file File) {
 			defer wg.Done()
-			dbmx.Lock()
-			defer dbmx.Unlock()
-
-			if file.Info.Size() > int64(*maxSize) {
-				panic(fmt.Sprintf("%s is bigger than max size (%s > %s)", file.Path, FormatBytes(uint64(file.Info.Size())), FormatBytes(uint64(*maxSize))))
-			}
 
 			data, err := file.Read()
 			if err != nil {
@@ -327,13 +299,18 @@ func main() {
 				return
 			}
 
-			log.Printf("Adding %s", file.Path)
+			db.Lock()
+			defer db.Unlock()
+
 			if _, err := insertQuery.Exec(file.Path, file.Info.ModTime(), file.Info.Mode(), data); err != nil {
 				panic(err)
 			}
+			log.Printf("Added %s", file.Path)
 		}(file)
 	}
 
 	wg.Wait()
-	tx.Commit()
+	if err := db.Commit(); err != nil {
+		panic(err)
+	}
 }
